@@ -37,13 +37,13 @@ include("parseExpr_staged.jl")
 # it returns just the cartesian product of possible indices.
 function buildrefsets(expr::Expr)
     c = copy(expr)
-    isexpr(c,:ref) || isexpr(c,:typed_vcat) || error("Unrecognized name in construction macro; expected $(string(c)) to be of the form name[...]")
+    # isexpr(c,:ref) || isexpr(c,:vcat) || isexpr(c,:typed_vcat) || isexpr(c, :vect) || error("Unrecognized name in construction macro; expected $(string(c)) to be of the form name[...]")
     idxvars = Any[]
     idxsets = Any[]
     idxpairs = IndexPair[]
     # Creating an indexed set of refs
-    cname = shift!(c.args)
-    refcall = Expr(:ref,esc(cname))
+    cname   = shift!(c.args)
+    refcall = Expr(:ref, cname)
     condition = :()
     if isexpr(c, :typed_vcat)
         if isexpr(c.args[1], :parameters)
@@ -139,9 +139,9 @@ function getloopedcode(c::Expr, code, condition, idxvars, idxsets, idxpairs, sym
     if hascond || hasdependentsets(idxvars,idxsets)
         # force a JuMPDict
         N = length(idxsets)
-        mac = :($(esc(varname)) = JuMPDict{$(sym),$N}())
+        mac = :($varname = JuMPDict{$(sym),$N}())
     else
-        mac = Expr(:macrocall,symbol("@gendict"),esc(varname),sym,idxsets...)
+        mac = Expr(:macrocall,symbol("@gendict"),varname,sym,idxsets...)
     end
     return quote
         $mac
@@ -152,6 +152,7 @@ end
 
 getloopedcode(c, code, condition, idxvars, idxsets, idxpairs, sym) = code
 
+localvar(x::Symbol) = _localvar(x)
 localvar(x::Expr) = Expr(:block, _localvar(x)...)
 _localvar(x::Symbol) = :(local $(esc(x)))
 function _localvar(x::Expr)
@@ -309,6 +310,12 @@ macro constraint(args...)
     c = length(extra) == 1 ? x        : nothing
     x = length(extra) == 1 ? extra[1] : x
 
+    crefflag = false
+    if isa(c, Expr)
+        crefflag = true
+        c.args[1] = esc(c.args[1])
+    end
+
     (x.head == :block) &&
         error("Code block passed as constraint. Perhaps you meant to use addConstraints instead?")
     if VERSION < v"0.5.0-dev+3231"
@@ -317,7 +324,6 @@ macro constraint(args...)
 
     # Strategy: build up the code for non-macro addconstraint, and if needed
     # we will wrap in loops to assign to the ConstraintRefs
-    crefflag = isa(c,Expr)
     refcall, idxvars, idxsets, idxpairs, condition = buildrefsets(c)
     # Build the constraint
     if isexpr(x, :call)
@@ -663,6 +669,11 @@ macro expression(args...)
         error("@expression: needs three arguments.")
     end
 
+    if isa(c, Expr)
+        crefflag = true
+        c.args[1] = esc(c.args[1])
+    end
+
     refcall, idxvars, idxsets, idxpairs, condition = buildrefsets(c)
     newaff, parsecode = parseExprToplevel(x, :q)
     code = quote
@@ -723,7 +734,8 @@ esc_nonconstant(x) = esc(x)
 const EMPTYSTRING = utf8("")
 
 macro variable(args...)
-    length(args) <= 1 &&
+    length(args) == 1 && (args = (args[1], gensym()))
+    length(args) == 0 &&
         error("in @variable: expected model as first argument, then variable information.")
     m = esc(args[1])
     x = args[2]
@@ -792,13 +804,34 @@ macro variable(args...)
     kwargs = filter(ex->isexpr(ex,:kw), extra)
     extra = filter(ex->!isexpr(ex,:kw), extra)
 
+    anonvar = isexpr(x, :vect) || isexpr(x, :vcat)
+    escd_var = (if anonvar
+        if isexpr(var, :vect)
+            Expr(:ref, :($(esc(gensym()))), copy(var.args)...)
+        elseif isexpr(var, :vcat)
+            Expr(:typed_vcat, :($(esc(gensym()))), copy(var.args)...)
+        else
+            @assert isa(var, Symbol)
+            var
+        end
+    else
+        if isa(var, Symbol)
+            esc(var)
+        else
+            @assert isa(var, Expr)
+            tmp = copy(var)
+            tmp.args[1] = esc(tmp.args[1])
+            tmp
+        end
+    end)
+    quotvarname = quot(getname(var))
+    escvarname  =  getname(escd_var)
+
     # process keyword arguments
     value = NaN
     obj = nothing
     inconstraints = nothing
     coefficients = nothing
-    quotvarname = quot(getname(var))
-    escvarname  = esc(getname(var))
     for ex in kwargs
         if ex.args[1] == :start
             value = esc(ex.args[2])
@@ -853,7 +886,7 @@ macro variable(args...)
         error("in @variable ($var): can only create one variable at a time when adding to existing constraints.")
 
         return assert_validmodel(m, quote
-            $(esc(var)) = Variable($m,$lb,$ub,$(quot(t)),$obj,$inconstraints,$coefficients,utf8(string($quotvarname)),$value)
+            $escd_var = Variable($m,$lb,$ub,$(quot(t)),$obj,$inconstraints,$coefficients,utf8(string($quotvarname)),$value)
             nothing
         end)
     end
@@ -861,16 +894,22 @@ macro variable(args...)
     if isa(var,Symbol)
         # Easy case - a single variable
         sdp && error("Cannot add a semidefinite scalar variable")
-        return assert_validmodel(m, quote
-            $(esc(var)) = Variable($m,$lb,$ub,$(quot(t)),utf8(string($quotvarname)),$value)
-            registervar($m, $(quot(var)), $(esc(var)))
-        end)
+        code = quote
+            $escd_var = Variable($m,$lb,$ub,$(quot(t)),utf8(string($quotvarname)),$value)
+        end
+        if !anonvar
+            code = quote
+                $code
+                registervar($m, $(quot(var)), $escd_var)
+            end
+        end
+        return assert_validmodel(m, code)
     end
     isa(var,Expr) || error("in @variable: expected $var to be a variable name")
 
     # We now build the code to generate the variables (and possibly the JuMPDict
     # to contain them)
-    refcall, idxvars, idxsets, idxpairs, condition = buildrefsets(var)
+    refcall, idxvars, idxsets, idxpairs, condition = buildrefsets(escd_var)
     clear_dependencies(i) = (isdependent(idxvars,idxsets[i],i) ? nothing : idxsets[i])
 
     code = :( $(refcall) = Variable($m, $lb, $ub, $(quot(t)), EMPTYSTRING, $value) )
@@ -896,7 +935,7 @@ macro variable(args...)
             error("Semidefinite variables cannot be provided bounds")
         end
 
-        looped = getloopedcode(var, code, condition, idxvars, idxsets, idxpairs, :Variable; lowertri=symmetric)
+        looped = getloopedcode(escd_var, code, condition, idxvars, idxsets, idxpairs, :Variable; lowertri=symmetric)
         code = quote
             $(esc(idxsets[1].args[1].args[2])) == $(esc(idxsets[2].args[1].args[2])) || error("Cannot construct symmetric variables with nonsquare dimensions")
             (Compat.issymmetric($lb) && Compat.issymmetric($ub)) || error("Bounds on symmetric variables must be symmetric")
@@ -915,15 +954,20 @@ macro variable(args...)
             $escvarname
         end)
     else
-        looped = getloopedcode(var, code, condition, idxvars, idxsets, idxpairs, :Variable)
+        code = getloopedcode(escd_var, code, condition, idxvars, idxsets, idxpairs, :Variable)
+        if !anonvar
+            code = quote
+                $code
+                push!($(m).dictList, $escvarname)
+                registervar($m, $quotvarname, $escvarname)
+                storecontainerdata($m, $escvarname, $quotvarname,
+                                   $(Expr(:tuple,map(clear_dependencies,1:length(idxsets))...)),
+                                   $idxpairs, $(quot(condition)))
+                isa($escvarname, JuMPContainer) && pushmeta!($escvarname, :model, $m)
+            end
+        end
         return assert_validmodel(m, quote
-            $looped
-            push!($(m).dictList, $escvarname)
-            registervar($m, $quotvarname, $escvarname)
-            storecontainerdata($m, $escvarname, $quotvarname,
-                               $(Expr(:tuple,map(clear_dependencies,1:length(idxsets))...)),
-                               $idxpairs, $(quot(condition)))
-            isa($escvarname, JuMPContainer) && pushmeta!($escvarname, :model, $m)
+            $code
             $escvarname
         end)
     end
@@ -980,6 +1024,10 @@ macro NLconstraint(m, x, extra...)
     # Canonicalize the arguments
     c = length(extra) == 1 ? x        : nothing
     x = length(extra) == 1 ? extra[1] : x
+
+    if isa(c, Expr)
+        c.args[1] = esc(c.args[1])
+    end
 
     if VERSION < v"0.5.0-dev+3231"
         x = comparison_to_call(x)
